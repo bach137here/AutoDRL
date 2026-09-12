@@ -1,0 +1,287 @@
+(function initUltraFormMasterTool() {
+    // 1. CHUẨN HÓA VĂN BẢN (KHỬ TIỀN TỐ STT & A/B/C/D)
+    function cleanText(str) {
+        if (!str) return '';
+        return str
+            .replace(/^\d+[\.\s\:\-]+/, '')          // Bỏ STT đầu câu (1., 2., 10., ...)
+            .replace(/^[a-zA-d][\.\)]\s*/i, '')       // Bỏ tiền tố đáp án (A., B., C., D., A)...)
+            .replace(/\(\d+\s*Points?\)/gi, '')         // Bỏ (1 Point), (2 Points)...
+            .replace(/[^\w\sàáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    // 2. TÍNH ĐỘ TƯƠNG ĐỒNG TỪ NGỮ (TOKEN JACCARD SIMILARITY)
+    function getSimilarityRatio(str1, str2) {
+        const set1 = new Set(str1.split(' ').filter(w => w.length > 1));
+        const set2 = new Set(str2.split(' ').filter(w => w.length > 1));
+        if (set1.size === 0 || set2.size === 0) return 0;
+
+        let intersection = 0;
+        set1.forEach(word => {
+            if (set2.has(word)) intersection++;
+        });
+
+        return intersection / Math.min(set1.size, set2.size);
+    }
+
+    // 3. PARSER JSON BẢO VỆ ĐA TẦNG (REGEX LINE-BY-LINE TRÍCH XUẤT KEY-VALUE)
+    function parseDirtyJSON(rawInput) {
+        if (!rawInput || !rawInput.trim()) throw new Error("Dữ liệu rỗng!");
+
+        let text = rawInput.trim()
+            .replace(/^```(?:json)?/i, '')
+            .replace(/```$/, '')
+            .trim();
+
+        // Tầng 1: Thử parse chuẩn
+        try {
+            return JSON.parse(text);
+        } catch (e) {}
+
+        // Tầng 2: Sửa trailing commas
+        try {
+            let fixedCommas = text.replace(/,\s*([\}\]])/g, '$1');
+            return JSON.parse(fixedCommas);
+        } catch (e) {}
+
+        // Tầng 3: Tự động đóng ngoặc nếu AI bị đứt đoạn token
+        try {
+            let autoClosed = text.trim();
+            if (!autoClosed.endsWith('}')) {
+                const lastQuote = autoClosed.lastIndexOf('"');
+                if (lastQuote !== -1) {
+                    autoClosed = autoClosed.substring(0, lastQuote + 1) + '\n}';
+                } else {
+                    autoClosed += '\n}';
+                }
+            }
+            let fixedCommas = autoClosed.replace(/,\s*([\}\]])/g, '$1');
+            return JSON.parse(fixedCommas);
+        } catch (e) {}
+
+        // Tầng 4: Bộ bóc tách Fallback quét Key : Value cưỡng chế
+        const result = {};
+        // Quét regex tìm các cấu trúc "key" : "value"
+        const regex = /"([^"\\]*(?:\\.[^"\\]*)*)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/g;
+        let match;
+        let count = 0;
+
+        while ((match = regex.exec(text)) !== null) {
+            const k = match[1].replace(/\\"/g, '"').trim();
+            const v = match[2].replace(/\\"/g, '"').trim();
+            if (k && v) {
+                result[k] = v;
+                count++;
+            }
+        }
+
+        if (count > 0) {
+            console.log(`Đã phục hồi được ${count} câu hỏi thông qua bộ lọc Regex!`);
+            return result;
+        }
+
+        // Tầng 5: Quét theo từng dòng (nếu AI dán thiếu cả dấu nháy bọc)
+        const lines = text.split('\n');
+        lines.forEach(line => {
+            const splitIdx = line.indexOf(':');
+            if (splitIdx > 0) {
+                let k = line.substring(0, splitIdx).replace(/^[{\s",]+|[",\s]+$/g, '').trim();
+                let v = line.substring(splitIdx + 1).replace(/^[{\s",]+|[",\s}]+$/g, '').trim();
+                if (k.length > 5 && v.length > 0) {
+                    result[k] = v;
+                    count++;
+                }
+            }
+        });
+
+        if (count > 0) {
+            return result;
+        }
+
+        throw new Error("Không thể trích xuất được câu hỏi/đáp án. Vui lòng kiểm tra lại văn bản AI dán vào!");
+    }
+
+    // 4. THU THẬP CÂU HỎI TRÊN FORM
+    const questionNodes = document.querySelectorAll('div[data-automation-id="questionItem"], div[role="listitem"]');
+    const questions = [];
+    const seenTitles = new Set();
+    const personalKeywords = ["họ và tên", "họ tên", "mssv", "mã số sinh viên", "mã sinh viên", "email sinh viên", "số điện thoại"];
+
+    questionNodes.forEach((node) => {
+        const titleEl = node.querySelector('[data-automation-id="questionTitle"]') || node.querySelector('.--title-content');
+        if (!titleEl) return;
+
+        const titleText = titleEl.innerText.replace(/\n/g, ' ').trim();
+        const lowerTitle = titleText.toLowerCase();
+
+        if (seenTitles.has(titleText)) return;
+        if (titleText.length < 40 && personalKeywords.some(kw => lowerTitle.includes(kw))) return;
+
+        seenTitles.add(titleText);
+        const optionEls = node.querySelectorAll('div[role="radio"], div[role="checkbox"], label');
+        const options = Array.from(optionEls).map(el => el.innerText.replace(/\n/g, ' ').trim()).filter(Boolean);
+
+        questions.push({
+            stt: questions.length + 1,
+            cauHoi: titleText,
+            dapAn: options
+        });
+    });
+
+    if (questions.length === 0) {
+        alert("⚠️ Không tìm thấy câu hỏi nào trên form!");
+        return;
+    }
+
+    // 5. TẠO PROMPT GỬI AI
+    let promptText = `Dưới đây là TOÀN BỘ ${questions.length} câu hỏi trắc nghiệm/khảo sát. Hãy giải giúp tôi.\n\n`;
+    promptText += `YÊU CẦU ĐẦU RA:\n`;
+    promptText += `Trả về kết quả duy nhất dạng JSON object theo mẫu:\n`;
+    promptText += `{\n  "Nội dung câu hỏi 1": "Nội dung đáp án chọn 1"\n}\n\n`;
+    promptText += `DANH SÁCH CÂU HỎI:\n` + JSON.stringify(questions, null, 2);
+
+    // 6. GIAO DIỆN POPUP
+    const oldModal = document.getElementById('ultra-form-modal');
+    if (oldModal) oldModal.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'ultra-form-modal';
+    modal.style.cssText = 'position:fixed;top:15px;right:15px;width:380px;background:#ffffff;border:2px solid #0078d4;box-shadow:0 8px 24px rgba(0,0,0,0.25);z-index:999999;padding:16px;border-radius:12px;font-family:Segoe UI,sans-serif;color:#333;';
+
+    modal.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+            <div style="display:flex; flex-direction:column; gap:4px;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <span style="background: linear-gradient(135deg, #0078d4, #6b21a8); color: white; border-radius: 6px; padding: 2px 6px; font-size: 11px; font-weight: bold;">⚡ PRO</span>
+                    <h3 style="margin:0; font-size:15px; font-weight:700; background: linear-gradient(90deg, #0078d4, #107c41); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+                        Auto Điền Form Thần Thánh
+                    </h3>
+                    <span style="font-size:12px; color:#666; font-weight:600;">(${questions.length} câu)</span>
+                </div>
+                <div style="font-size: 11px; color: #6e6e6e; font-style: italic; display: flex; align-items: center; gap: 4px;">
+                    <span>Crafted with ❤️ by <strong style="color:#0078d4; font-style:normal;">Bách Phan</strong> & <strong style="color:#a855f7; font-style:normal;">Gemini</strong></span>
+                </div>
+            </div>
+            <button id="close-modal-btn" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888;">✕</button>
+        </div>
+
+        <button id="copy-prompt-btn" style="width:100%;padding:10px;background:#0078d4;color:#fff;border:none;border-radius:6px;font-weight:bold;cursor:pointer;font-size:13px;margin-bottom:12px;">📋 Copy Prompt Gửi AI</button>
+
+        <textarea id="custom-json-input" placeholder='Dán kết quả JSON từ AI vào đây...' style="width:100%;height:120px;box-sizing:border-box;border:1px solid #ccc;border-radius:6px;padding:8px;font-family:monospace;font-size:11px;resize:vertical;"></textarea>
+        
+        <button id="auto-fill-btn" style="width:100%;padding:10px;background:#107c41;color:#fff;border:none;border-radius:6px;font-weight:bold;cursor:pointer;margin-top:8px;font-size:13px;">🚀 Tự Động Điền Khớp Cao</button>
+    `;
+
+    document.body.appendChild(modal);
+
+    // 7. THUẬT TOÁN ĐIỀN ĐÁP ÁN SIÊU KHỚP
+    function executeAutoFill(answersObj) {
+        const normalizedAnswers = [];
+        for (const [key, val] of Object.entries(answersObj)) {
+            if (!val || typeof val !== 'string' || val.trim() === '') continue;
+            normalizedAnswers.push({
+                cleanKey: cleanText(key),
+                cleanVal: cleanText(val),
+                rawValue: val
+            });
+        }
+
+        let filledCount = 0;
+        let missedList = [];
+
+        questionNodes.forEach((node, idx) => {
+            const titleEl = node.querySelector('[data-automation-id="questionTitle"]') || node.querySelector('.--title-content');
+            if (!titleEl) return;
+
+            const currentTitleClean = cleanText(titleEl.innerText);
+
+            let bestMatch = null;
+            let highestRatio = 0;
+
+            normalizedAnswers.forEach(item => {
+                const ratio = getSimilarityRatio(currentTitleClean, item.cleanKey);
+                if (ratio > highestRatio) {
+                    highestRatio = ratio;
+                    bestMatch = item;
+                }
+            });
+
+            if (bestMatch && highestRatio >= 0.4) {
+                const targetAnswerClean = bestMatch.cleanVal;
+                const optionEls = node.querySelectorAll('div[role="radio"], div[role="checkbox"], label');
+                let matchedOption = false;
+
+                let bestOpt = null;
+                let maxOptRatio = 0;
+
+                optionEls.forEach(opt => {
+                    const optTextClean = cleanText(opt.innerText);
+                    const optRatio = getSimilarityRatio(optTextClean, targetAnswerClean);
+
+                    if (optTextClean === targetAnswerClean || optTextClean.includes(targetAnswerClean) || targetAnswerClean.includes(optTextClean)) {
+                        bestOpt = opt;
+                        maxOptRatio = 1;
+                    } else if (optRatio > maxOptRatio) {
+                        maxOptRatio = optRatio;
+                        bestOpt = opt;
+                    }
+                });
+
+                if (bestOpt && maxOptRatio >= 0.35) {
+                    bestOpt.click();
+                    matchedOption = true;
+                    filledCount++;
+                }
+
+                if (!matchedOption) {
+                    missedList.push(`Câu ${idx + 1}: Không khớp được LỰA CHỌN cho "${bestMatch.rawValue}"`);
+                }
+            } else {
+                missedList.push(`Câu ${idx + 1}: Không khớp được CÂU HỎI`);
+            }
+        });
+
+        alert(`🎉 Đã tự động điền thành công ${filledCount}/${questionNodes.length} câu!`);
+        if (missedList.length > 0) {
+            console.warn("⚠️ Danh sách câu chưa khớp được:", missedList);
+        }
+    }
+
+    // 8. XỬ LÝ SỰ KIỆN
+    document.getElementById('close-modal-btn').onclick = () => modal.remove();
+
+    document.getElementById('copy-prompt-btn').onclick = () => {
+        navigator.clipboard.writeText(promptText).then(() => {
+            alert(`🎉 Đã copy prompt của ${questions.length} câu vào Clipboard!`);
+        }).catch(() => {
+            const tempArea = document.createElement('textarea');
+            tempArea.value = promptText;
+            document.body.appendChild(tempArea);
+            tempArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempArea);
+            alert(`🎉 Đã copy prompt!`);
+        });
+    };
+
+    document.getElementById('auto-fill-btn').onclick = () => {
+        const rawInput = document.getElementById('custom-json-input').value;
+        if (!rawInput.trim()) {
+            alert("⚠️ Vui lòng dán dữ liệu đáp án vào ô!");
+            return;
+        }
+
+        try {
+            const parsedAnswers = parseDirtyJSON(rawInput);
+            const totalExtracted = Object.keys(parsedAnswers).length;
+            if (totalExtracted === 0) {
+                throw new Error("Không nhận diện được câu hỏi nào từ dữ liệu dán vào.");
+            }
+            executeAutoFill(parsedAnswers);
+        } catch (e) {
+            alert("❌ " + e.message);
+        }
+    };
+})();
