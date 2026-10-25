@@ -10,3 +10,4 @@ Tool giúp bạn auto fill các Form kiếm ĐRL.
 3) Dán kết quả dạng JSON AI trả về và tool sẽ tự động auto-fill.
 
 ## TIPS: Để tăng độ chính xác cho đáp án bạn có thể thêm cho AI nhiều context về chủ đề bạn đang làm.
+[DEMO](demo.mp4)
